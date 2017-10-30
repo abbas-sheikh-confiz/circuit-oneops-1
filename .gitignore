@@ -19,4 +19,4 @@ bin/*
 .kitchen/
 .kitchen.local.yml
 
-travis.yml
+.travis.yml
