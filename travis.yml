@@ -1,0 +1,44 @@
+language: ruby
+sudo: false
+
+before_install:
+  - gem install thor -v 0.19.1
+  - gem install rails-observers -v 0.1.2
+  - gem install activeresource -v 4.0.0 
+  - gem install aws-s3 -v 0.6.3
+  - gem install mime-types -v 1.25.1
+  - gem install kramdown -v 1.9.0
+  - gem install rake
+  - gem install rspec
+  - gem install simplecov
+  - gem install ffi -v 1.9.10
+  - gem install mixlib-shellout -v 1.4.0
+  - gem install ohai -v 7.4.1
+  - gem install net-ssh -v 2.6.5
+  - gem install rack -v 1.6.8
+  - gem install chef -v 11.18.12
+  - gem install json -v 1.8.6
+  - gem install nokogiri -v 1.6.0
+  - gem install fog -v 1.38.0
+  - gem install net-scp -v 1.1.2
+  - gem install net-ldap -v 0.6.1
+  - gem install fog-azure-rm -v 0.3.3
+  - gem install crack -v 0.4.3
+
+script: bash ./rake-script.sh
+
+matrix:
+  fast_finish: true
+  include:
+    - rvm: 2.0.0
+    - rvm: 2.1.0
+    - rvm: 2.1.1
+    - rvm: 2.1.5
+    - rvm: 2.2.0
+    - rvm: 2.3.0
+    - rvm: jruby-head
+  allow_failures:
+    - rvm: jruby-head
+
+notifications:
+  email: false
