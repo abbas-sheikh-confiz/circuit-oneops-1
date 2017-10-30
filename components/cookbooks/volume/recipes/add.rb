@@ -39,119 +39,91 @@ end
 storage = nil
 storage,device_maps = get_storage()
 
-include_recipe "shared::set_provider"
+rfcCi = node[:workorder][:rfcCi]
+attrs = rfcCi[:ciAttributes]
 
-size = node.workorder.rfcCi.ciAttributes["size"].gsub(/\s+/, "")
+#Check size
+size = attrs[:size].gsub(/\s+/, "")
+if size == '-1'
+  Chef::Log.info('skipping because size = -1')
+  return
+end
 
-storage_provider = node.storage_provider_class
-if (storage_provider =~ /azure/) && !storage.nil?        
-       dev_id=nil
-       node.set[:device_maps] = device_maps
-       device_maps.each do |dev_vol|
-            dev_id = dev_vol.split(":")[4]
-          end
-       Chef::Log.info("executing lsblk #{dev_id}")
-       `lsblk #{dev_id}`
-       if $?.to_i != 0
-         Chef::Log.info("Device NOT attached, attaching the disk now ...")
-         include_recipe "azuredatadisk::attach" 
-       else
-         Chef::Log.info("Device is already attached")
-       end  
- end
- 
-package "lvm2"
-package "mdadm"
+#Check raid requirements
+mode = attrs[:mode]
+level = mode.gsub('raid','')
+if mode == 'raid0' && device_maps.size < 2
+  exit_with_error("Minimum of 2 storage slices are required for #{mode}")
+elsif mode == 'raid1' && (device_maps.size < 2 || device_maps.size%2 != 0)
+  exit_with_error("Minimum of 2 storage slices and storage slice count mod 2 are required for #{mode}")
+elsif mode == 'raid5' && device_maps.size < 3
+  exit_with_error("Minimum of 3 storage slices are required for #{mode}")
+elsif mode == 'raid10' && (device_maps.size < 4 || device_maps.size%2 != 0)
+  exit_with_error("Minimum of 4 storage slices and storage slice count mod 2 are required for #{mode}")
+end
 
+include_recipe "shared::set_provider_new"
+
+if !storage.nil?
+  include_recipe "shared::set_provider_new"
+  objStorage = VolumeComponent::Storage.new(node,storage,device_maps)        
+  objStorage.set_provider_data_all  
+  storage_devices = objStorage.storage_devices
+  compute = objStorage.compute
+end
+
+package 'lvm2'
+package 'mdadm' do
+  not_if{mode == 'no-raid'}
+end
 
 storageUpdated = false
 if !storage.nil?
    storageUpdated = storage.ciBaseAttributes.has_key?("size")
 end
-cloud_name = node[:workorder][:cloud][:ciName]
 newDevicesAttached = ""
-mode = "no-raid"
-
-Chef::Log.info("-------------------------------------------------------------")
-Chef::Log.info("Volume Size : "+size )
-Chef::Log.info("-------------------------------------------------------------")
-
-if size == "-1"
-  Chef::Log.info("skipping because size = -1")
-  return
-end
-
-raid_device = "/dev/md/#{node.workorder.rfcCi.ciName}"
-rfc_action = "#{node.workorder.rfcCi.rfcAction}"
+logical_name = rfcCi[:ciName]
+raid_device = "/dev/md/#{logical_name}"
+rfc_action = rfcCi[:rfcAction]
 no_raid_device = " "
-
-Chef::Log.info("-------------------------------------------------------------")
-Chef::Log.info("Raid Device : "+raid_device)
-Chef::Log.info("RFC Action  : "+rfc_action)
-Chef::Log.info("-------------------------------------------------------------")
-
 node.set["raid_device"] = raid_device
-platform_name = node.workorder.box.ciName
-logical_name = node.workorder.rfcCi.ciName
+platform_name = node[:workorder][:box][:ciName]
+token_class = node[:provider_class]
 
+Chef::Log.info("-------------------------------------------------------------")
+Chef::Log.info("Volume Size      : #{size}")
+Chef::Log.info("Raid Device      : #{raid_device}")
+Chef::Log.info("RFC Action       : #{rfc_action}")
+Chef::Log.info("Storage Provider : #{node[:storage_provider_class]}")
+Chef::Log.info("Storage          : #{storage.inspect.gsub("\n",' ')}")
+Chef::Log.info("-------------------------------------------------------------")
 
-cloud_name = node[:workorder][:cloud][:ciName]
-token_class = node[:workorder][:services][:compute][cloud_name][:ciClassName].split(".").last.downcase
-
-Chef::Log.info("storage_provider:#{storage_provider}")
 # need ruby block so package resource above run first
 ruby_block 'create-iscsi-volume-ruby-block' do
+  not_if {storage.nil?}
   block do
-
-    Chef::Log.info("------------------------------------------------------")
-    Chef::Log.info("Storage: "+storage.inspect.gsub("\n"," "))
-    Chef::Log.info("------------------------------------------------------")
-
-    if storage.nil?
-      Chef::Log.info("no DependsOn Storage - skipping")
-    else
-      dev_list = ""
-      if node[:storage_provider_class] =~ /azure/
-        Chef::Log.info(" the storage device is already attached")
-        vols = Array.new
-        node[:device_maps].each do |dev_vol|
-          vol_id = dev_vol.split(":")[3]
-          dev_id = dev_vol.split(":")[4]
-          vols.push dev_id
-          dev_list += dev_id+" "
-        end
-      else        
-        provider = node[:iaas_provider]
-        storage_provider = node[:storage_provider]
-
-        instance_id = node.workorder.payLoad.ManagedVia[0]["ciAttributes"]["instance_id"]
-        Chef::Log.info("instance_id: "+instance_id)
-        compute = provider.servers.get(instance_id)
 
         vols = Array.new
         dev_list = ""
-        i = 0
-        device_maps.each do |dev_vol|
-          vol_id = dev_vol.split(":")[0]
-          dev_id = dev_vol.split(":")[1]
-          Chef::Log.info("vol_id: "+vol_id)
-          vol = nil
-          case token_class
-            when /rackspace|ibm/
-              vol = storage_provider.volumes.get vol_id
-            else
-              vol = provider.volumes.get vol_id
-          end
 
+        storage_devices.each do |storage_device|
+
+          vol_id = storage_device.storage_id
+          dev_id = storage_device.planned_device_id
+          Chef::Log.info("vol_id: #{vol_id}, planned dev_id: #{dev_id}, assigned dev_id: #{storage_device.assigned_device_id}")
+
+          vol = storage_device.object
           Chef::Log.info("vol: "+ vol.inspect.gsub("\n"," ").gsub("<","").gsub(">","") )
+
           begin
+            #TO-DO move the rest of providers attach action to attach method of StorageDevice object
 
             case token_class
               when /ibm/
                 if vol.attached?
                   Chef::Log.error("attached already, no way to determine device")
                   # mdadm sometime reassembles with _0
-                  new_raid_device = `ls -1 #{raid_device}* 2>/dev/null`.chop
+                  new_raid_device = execute_command("ls -1 #{raid_device}* 2>/dev/null").stdout.chop
                   if new_raid_device.empty?
                     exit 1
                   else
@@ -162,108 +134,15 @@ ruby_block 'create-iscsi-volume-ruby-block' do
                 end
 
                 # determine new device by watching /dev because ibm (kvm) doesn't attach it to the specified device
-                orig_device_list = `ls -1 /dev/vd*`.split("\n")
+                orig_device_list = execute_command('ls -1 /dev/vd*').stdout.split("\n")
                 compute.attach(vol.id)
-                device_list = `ls -1 /dev/vd*`.split("\n")
-                retry_count = 0
-                max_retry_count = 30
-                while orig_device_list.size == device_list.size &&
-                    retry_count < max_retry_count do
-                  sleep 10
-                  retry_count +=1
-                  device_list = `ls -1 /dev/vd*`.split("\n")
-                end
-
-                if retry_count == max_retry_count
-                  exit_with_error("max retry count of "+max_retry_count.to_s+" hit ... device list: "+orig_device_list.inspect.gsub("\n"," "))
-                  exit 1
-                end
-
-                new_dev = nil
-                device_list.each do |dev|
-                  found = false
-                  orig_device_list.each do |d|
-                    if dev == d
-                      found = true
-                    end
-                  end
-                  if !found
-                    new_dev = dev
-                    break
-                  end
-                end
-
-                if new_dev != nil
-                  dev_id = new_dev
-                  Chef::Log.info "device: "+dev_id
-                  node.set["raid_device"] = dev_id
-                end
+                dev_id = get_device_id(orig_device_list, 'vd', 30, 10)
+                Chef::Log.info "device: "+dev_id
+                node.set["raid_device"] = dev_id
 
               when /openstack/
-                if vol.attachments != nil && vol.attachments.size > 0 &&
-                    vol.attachments[0]["serverId"] == instance_id
-                  Chef::Log.error("attached already, no way to determine device")
-                  # mdadm sometime reassembles with _0
-                  new_raid_device = `ls -1 #{raid_device}* 2>/dev/null`.chop
-                  non_raid_device  = `ls -1 /dev/#{platform_name}/#{node.workorder.rfcCi.ciName}* 2>/dev/null`.chop
-                  if new_raid_device.empty? && non_raid_device.empty?
-                    Chef::Log.warn("Cleanup Failed Attempt ")
-                    vol.detach instance_id, vol_id
-                    exit 1
-                  else
-                    if new_raid_device.empty?
-                      raid_device = non_raid_device
-                      no_raid_device = non_raid_device
-                    else
-                      raid_device = new_raid_device
-                      no_raid_device = new_raid_device
-                    end
-                  next
-                  end
-                end
-
-
-                Chef::Log.info("-------------------------------------------")
-                Chef::Log.info("dev_id: "+dev_id)
-                Chef::Log.info("Instance_id: "+instance_id)
-                # determine new device by by watching /dev because openstack (kvm) doesn't attach it to the specified device
-                orig_device_list = `ls -1 /dev/vd*`.split("\n")
-                vol.attach instance_id, dev_id
-                Chef::Log.info("Device Attached ......")
-                device_list = `ls -1 /dev/vd*`.split("\n")
-                retry_count = 0
-                max_retry_count = 12
-                while orig_device_list.size == device_list.size &&
-                    retry_count < max_retry_count do
-                  sleep 15
-                  retry_count +=1
-                  device_list = `ls -1 /dev/vd*`.split("\n")
-                end
-
-                if retry_count == max_retry_count
-                  exit_with_error("max retry count of "+max_retry_count.to_s+" hit ... device list: "+orig_device_list.inspect.gsub("\n"," "))
-                end
-
-                new_dev = nil
-                device_list.each do |dev|
-                  found = false
-                  orig_device_list.each do |d|
-                    if dev == d
-                      found = true
-                    end
-                  end
-                  if !found
-                    new_dev = dev
-                    break
-                  end
-                end
-
-                if new_dev != nil
-                  dev_id = new_dev
-                  Chef::Log.info "Assigned Device: "+dev_id
-                  Chef::Log.info("-------------------------------------------")
-                  no_raid_device = dev_id
-                end
+                storage_device.attach unless storage_device.is_attached
+                dev_id = storage_device.assigned_device_id
 
               when /rackspace/
                 rackspace_dev_id = dev_id.gsub(/\d+/,"")
@@ -282,7 +161,8 @@ ruby_block 'create-iscsi-volume-ruby-block' do
                 vol.server = compute
 
               when /azure/
-                Chef::Log.info(" the storage device is already attached")
+                storage_device.attach unless storage_device.is_attached
+                dev_id = storage_device.assigned_device_id
 
             end
           rescue Fog::Compute::AWS::Error=>e
@@ -293,72 +173,25 @@ ruby_block 'create-iscsi-volume-ruby-block' do
               exit 1
             end
           end
+
+          Chef::Log.info("storage: #{storage_device.storage_id}, attached?: #{storage_device.is_attached}, Planned dev_id: #{storage_device.planned_device_id}, Assigned dev_id: #{storage_device.assigned_device_id}")
+
+          # wait until all are attached
+          max_retry = 10
+          retry_count = 0
+          while !storage_device.is_attached && retry_count < max_retry do
+            storage_device.set_provider_data
+            retry_count += 1
+            sleep 10 unless storage_device.is_attached
+          end
+
+          exit_with_error("Could not determined assigned device_id for storage #{storage_device.storage_id}") if dev_id.nil?
           vols.push vol_id
           dev_list += dev_id+" "
-          i+=1
-        end
+        end #storage_devices.each do |storage_device|
 
-        # wait until all are attached
-        fin = false
-        max_retry = 10
-        retry_count = 0
-        while !fin && retry_count<max_retry do
-          fin = true
-          vols.each do |vol_id|
-            vol = nil
-            if token_class =~ /rackspace|ibm/
-              vol = storage_provider.volumes.get vol_id
-            else
-              vol = provider.volumes.get  vol_id
-            end
 
-            vol_state = ''
-            if token_class =~ /openstack/
-              vol_state = vol.status
-            else
-              vol_state = vol.state
-            end
-            Chef::Log.info("vol: "+vol_id+" state:"+vol_state)
-            if vol_state.downcase != "attached" && vol_state.downcase != "in-use"
-              fin = false
-              sleep 10
-            end
-          end
-          retry_count +=1
-
-        end
-
-      end
       newDevicesAttached = dev_list
-      if node.workorder.rfcCi.ciAttributes.has_key?("mode")
-        mode = node.workorder.rfcCi.ciAttributes["mode"]
-      end
-      level = mode.gsub("raid","")
-      msg = ""
-      case mode
-        when "raid0"
-          if vols.size < 2
-            msg = "Minimum of 2 storage slices are required for "+mode
-          end
-        when "raid1"
-          if vols.size < 2 || vols.size%2 != 0
-            msg = "Minimum of 2 storage slices and storage slice count mod 2 are required for "+mode
-          end
-        when "raid5"
-          if vols.size < 3
-            msg = "Minimum of 3 storage slices are required for "+mode
-          end
-        when "raid10"
-          if vols.size < 4 || vols.size%2 != 0
-            msg = "Minimum of 4 storage slices and storage slice count mod 2 are required for "+mode
-          end
-      end
-      unless msg.empty?
-        puts "***FAULT:FATAL=#{msg}"
-        e = Exception.new("no backtrace")
-        e.set_backtrace("")
-        raise e
-      end
       has_created_raid = false
       exec_count = 0
       max_retry = 10
@@ -395,10 +228,7 @@ ruby_block 'create-iscsi-volume-ruby-block' do
         Chef::Log.info("No Raid Device ID :" +no_raid_device)
         raid_device = no_raid_device
         node.set["raid_device"] = no_raid_device
-
-      end
-
-    end
+      end #if vols.size > 1 && mode != 'no-raid'
 
   end
 end
@@ -409,7 +239,6 @@ _mount_point = nil
 _device = nil
 _fstype = nil
 _options = nil
-attrs = node.workorder.rfcCi.ciAttributes
 if attrs.has_key?("mount_point")
   Chef::Log.info("using filesystem-in-volume logic")
   _mount_point = attrs["mount_point"]
@@ -425,47 +254,64 @@ if node[:platform_family] == "rhel" && node[:platform_version].to_i >= 7
     provider Chef::Provider::Service::Systemd
   end
 end
+
 ruby_block 'create-ephemeral-volume-on-azure-vm' do
   only_if { (storage.nil? && token_class =~ /azure/ && _fstype != 'tmpfs') }
   block do
-     initial_mountpoint = '/mnt/resource'
-     restore_script_dir = '/opt/oneops/azure-restore-ephemeral-mntpts'
-     script_fullpath_name = "#{restore_script_dir}/#{logical_name}.sh"
-    `mkdir #{restore_script_dir}`
-    `touch #{script_fullpath_name}`
+    restore_script_dir = '/opt/oneops/azure-restore-ephemeral-mntpts'
+    initial_mountpoint = '/mnt/resource'
+    script_file_path   = "#{restore_script_dir}/#{logical_name}.sh"
+    ephemeral_device   = '/dev/sdb1'
+    rc_file_path       = '/etc/rc.d/rc.local'
 
-    Chef::Log.info("unmounting #{initial_mountpoint}")
-    `echo "umount #{initial_mountpoint}" > #{script_fullpath_name}`
+    # Create restore directory with path
+    `mkdir -p #{restore_script_dir}`
 
-    ephemeralDevice = '/dev/sdb1'
-    `echo "pvcreate -f #{ephemeralDevice}" >> #{script_fullpath_name}`
-    `echo "vgcreate #{platform_name}-eph #{ephemeralDevice}" >> #{script_fullpath_name}`
+    l_switch = size =~ /%/ ? '-l' : '-L'
+    f_switch = node[:platform_family] == 'rhel' && node[:platform_version].to_i >= 7 ? '' : '-f'
 
-    l_switch = "-L"
-    if size =~ /%/
-      l_switch = "-l"
-    end
-    `echo ""yes" | lvcreate #{l_switch} #{size} -n #{logical_name} #{platform_name}-eph" >> #{script_fullpath_name}`
-    `echo "if [ ! -d #{_mount_point}/lost+found ]" >> #{script_fullpath_name}`
-    `echo "then" >> #{script_fullpath_name}`
-    if node[:platform_family] == "rhel" && (node[:platform_version]).to_i >= 7
-      # -f switch not valid in latest mkfs
-      `echo "mkfs -t #{_fstype} /dev/#{platform_name}-eph/#{logical_name}" >> #{script_fullpath_name}`
-    else
-      `echo "mkfs -t #{_fstype} -f /dev/#{platform_name}-eph/#{logical_name}" >> #{script_fullpath_name}`
-    end
-    `echo "fi" >> #{script_fullpath_name}`
-    `echo "mkdir -p #{_mount_point}" >> #{script_fullpath_name}`
-    `echo "mount /dev/#{platform_name}-eph/#{logical_name} #{_mount_point}" >> #{script_fullpath_name}`
-    `sudo chmod +x #{script_fullpath_name}`
-     awk_cmd = "awk /#{logical_name}.sh/ /etc/rc.d/rc.local | wc -l"
-    `echo "count=\\$(#{awk_cmd})">> #{script_fullpath_name}` # Check whether script is already added to rc.local, add restore script if not present.
-    `echo "if [ \\$count == 0 ];then" >> #{script_fullpath_name}` 
-     `echo "sudo echo \\"sh #{script_fullpath_name}\\" >> \/etc\/rc.d\/rc.local" >> #{script_fullpath_name}`
-     `echo "fi" >> #{script_fullpath_name}`
-    `sudo chmod +x /etc/rc.d/rc.local`
-     Chef::Log.info("executing #{script_fullpath_name} script")
-    `sudo sh "#{script_fullpath_name}"`
+    mount_script = "#!/bin/bash\n"                                                                            \
+                   "\n"                                                                                       \
+                   "EXIT_SUCCESS=0\n"                                                                         \
+                   "EXIT_CRITICAL=2\n"                                                                        \
+                   "IS_FORMATTED=0\n"                                                                         \
+                   "\n"                                                                                       \
+                   "umount #{initial_mountpoint}\n"                                                           \
+                   "pvcreate -f #{ephemeral_device}\n"                                                        \
+                   "vgcreate #{platform_name}-eph #{ephemeral_device}\n"                                      \
+                   "\"yes\" | lvcreate #{l_switch} #{size} -n #{logical_name} #{platform_name}-eph\n"         \
+                   "\n"                                                                                       \
+                   "mount /dev/#{platform_name}-eph/#{logical_name} #{_mount_point}\n"                        \
+                   "if [ ! -d #{_mount_point}/lost+found ]; then\n"                                           \
+                   "  mkfs -t #{_fstype} #{f_switch} /dev/#{platform_name}-eph/#{logical_name}\n"             \
+                   "  mkdir -p #{_mount_point}\n"                                                             \
+                   "  mount /dev/#{platform_name}-eph/#{logical_name} #{_mount_point}\n"                      \
+                   "  $IS_FORMATTED=1\n"                                                                      \
+                   "fi\n"                                                                                     \
+                   "\n"                                                                                       \
+                   "count=$(awk /#{logical_name}.sh/ #{rc_file_path} | wc -l)\n"                              \
+                   "if [ $count == 0 ]; then\n"                                                               \
+                   "  sudo echo \"sh #{script_file_path}\" >> #{rc_file_path}\n"                              \
+                   "  exit_status=$EXIT_SUCCESS\n"                                                            \
+                   "elif [ $IS_FORMATTED == 1 ]; then\n"                                                      \
+                   "  echo 'CRITICAL - Mount Points are restored but data is lost.'\n"                        \
+                   "  exit_status=$EXIT_CRITICAL\n"                                                           \
+                   "else\n"                                                                                   \
+                   "  exit_status=$EXIT_SUCCESS\n"                                                            \
+                   "fi\n"                                                                                     \
+                   "\n"                                                                                       \
+                   "exit $exit_status\n"                                                                      \
+                   "\n"
+
+    Chef::Log.info("Writing mount points restoration script '#{script_file_path}'...")
+    File.open(script_file_path, 'w') { |file| file.write(mount_script) }
+
+    # Make script and rc.local files executable
+    `sudo chmod +x #{script_file_path}`
+    `sudo chmod +x #{rc_file_path}`
+
+    Chef::Log.info("Executing '#{script_file_path}' script...")
+    `sudo sh "#{script_file_path}"`
   end
 end
 
@@ -553,7 +399,7 @@ ruby_block 'create-ephemeral-volume-ruby-block' do
     if $?.to_i == 0
       `lvdisplay /dev/#{platform_name}-eph/#{logical_name}`
       if $?.to_i != 0
-        execute_command("yes | lvcreate #{l_switch} #{size} -n #{logical_name} #{platform_name}-eph")
+        execute_command("yes | lvcreate #{l_switch} #{size} -n #{logical_name} #{platform_name}-eph",true)
       else
         Chef::Log.warn("logical volume #{platform_name}-eph/#{logical_name} already exists and hence cannot recreate .. prefer replacing compute")
       end
@@ -624,7 +470,7 @@ ruby_block 'create-storage-non-ephemeral-volume' do
     `lvdisplay /dev/#{platform_name}/#{logical_name}`
 
     if $?.to_i != 0
-      execute_command("yes | lvcreate #{l_switch} #{size} -n #{logical_name} #{platform_name}")
+      execute_command("yes | lvcreate #{l_switch} #{size} -n #{logical_name} #{platform_name}",true)
     else
         Chef::Log.warn("logical volume #{platform_name}/#{logical_name} already exists and hence cannot recreate .. prefer replacing compute")
     end
@@ -645,8 +491,8 @@ ruby_block 'create-storage-non-ephemeral-volume' do
     end
 
     if ((check_persistent && rfc_action == "update" && token_class =~ /openstack/) || (rfc_action == "update" && storageUpdated))
-      new_size = node.workorder.rfcCi.ciAttributes["size"].gsub(/\s+/, "")
-      old_size = node.workorder.rfcCi.ciBaseAttributes[:size]
+      new_size = size
+      old_size = rfcCi[:ciBaseAttributes][:size]
 
       #if old_size is not availabe in workorder, setting old_size from actual mount point of compute
       if old_size.nil? || old_size =~ /%/
@@ -673,12 +519,12 @@ ruby_block 'create-storage-non-ephemeral-volume' do
       if (size == "0G" || ((!storageUpdated) && size =~ /%/))
         Chef::Log.info("Storage is not extended")
       else
-        execute_command("yes |lvextend #{l_switch} +#{size} /dev/#{platform_name}/#{logical_name}")
+        execute_command("yes |lvextend #{l_switch} +#{size} /dev/#{platform_name}/#{logical_name}",true)
       end
 
     end
 
-    execute_command("vgchange -ay #{platform_name}")
+    execute_command("vgchange -ay #{platform_name}",true)
 
   end
 end
@@ -699,12 +545,11 @@ ruby_block 'filesystem' do
       Chef::Log.info("Not creating the fstab entry for epheremal on azure compute")
       Chef::Log.info("auto mounting is being handle in rc.local, needs to be revisited.")
     else
-      block_dev = node.workorder.rfcCi
-      _device = "/dev/#{platform_name}/#{block_dev['ciName']}"
+      _device = "/dev/#{platform_name}/#{logical_name}"
 
       # if ebs/storage exists then use it, else use the -eph ephemeral volume
       if ! ::File.exists?(_device)
-        _device = "/dev/#{platform_name}-eph/#{block_dev['ciName']}"
+        _device = "/dev/#{platform_name}-eph/#{logical_name}"
 
         if ! ::File.exists?(_device)
           # micro,tiny and rackspace don't have ephemeral
